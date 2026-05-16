@@ -50,6 +50,61 @@ paper_trading_scheduler: PaperTradingScheduler | None = None
 context_maintenance_scheduler: ContextMaintenanceScheduler | None = None
 
 
+def apply_proxy_env(proxy: str | None) -> None:
+    """统一更新进程环境变量代理,让所有 httpx 默认 Client (trust_env=True) 走该代理。
+
+    传空字符串 / None 时清除环境变量(取消代理)。
+    NO_PROXY 默认含 localhost / 回环地址,避免本地访问绕一圈。
+    """
+    p = (proxy or "").strip()
+    if p:
+        os.environ["HTTP_PROXY"] = p
+        os.environ["HTTPS_PROXY"] = p
+        os.environ.setdefault("NO_PROXY", "localhost,127.0.0.1,::1,0.0.0.0")
+        logger.info(f"HTTP/HTTPS 代理已应用: {p}")
+    else:
+        for key in ("HTTP_PROXY", "HTTPS_PROXY"):
+            os.environ.pop(key, None)
+        logger.info("HTTP/HTTPS 代理已清除")
+
+
+def setup_proxy():
+    """启动时把已配置的 HTTP 代理桥接到环境变量。
+
+    优先级:
+    1. 已存在的 HTTP_PROXY / HTTPS_PROXY 环境变量(用户显式覆盖,不动)
+    2. app_settings.http_proxy(UI 配置)
+    3. .env 中的 http_proxy(Settings.http_proxy)
+    """
+    if os.environ.get("HTTP_PROXY") or os.environ.get("HTTPS_PROXY"):
+        logger.info(
+            f"沿用现有环境变量代理: HTTP_PROXY={os.environ.get('HTTP_PROXY', '')} "
+            f"HTTPS_PROXY={os.environ.get('HTTPS_PROXY', '')}"
+        )
+        os.environ.setdefault("NO_PROXY", "localhost,127.0.0.1,::1,0.0.0.0")
+        return
+
+    proxy = ""
+    try:
+        db = SessionLocal()
+        try:
+            setting = (
+                db.query(AppSettings).filter(AppSettings.key == "http_proxy").first()
+            )
+            if setting and setting.value:
+                proxy = setting.value.strip()
+        finally:
+            db.close()
+    except Exception:
+        pass
+
+    if not proxy:
+        proxy = (Settings().http_proxy or "").strip()
+
+    if proxy:
+        apply_proxy_env(proxy)
+
+
 def setup_ssl():
     """设置 SSL 证书环境（企业代理环境）"""
     settings = Settings()
@@ -342,6 +397,31 @@ def seed_data_sources():
             "supports_batch": False,
             "test_symbols": ["601127", "600519", "300750"],
         },
+        {
+            "name": "Tushare K线",
+            "type": "kline",
+            "provider": "tushare",
+            "config": {
+                "token": "",
+                "description": "Tushare Pro 日线数据,需 pip install tushare 并配 token。仅 A 股。",
+            },
+            "enabled": False,
+            "priority": 10,  # 作为腾讯失败后的备份
+            "supports_batch": False,
+            "test_symbols": ["600519"],
+        },
+        {
+            "name": "YFinance K线",
+            "type": "kline",
+            "provider": "yfinance",
+            "config": {
+                "description": "Yahoo Finance,需 pip install yfinance。适用 HK/US,A 股不可用。",
+            },
+            "enabled": False,
+            "priority": 20,
+            "supports_batch": False,
+            "test_symbols": ["AAPL"],
+        },
         # 资金流向数据源
         {
             "name": "东方财富资金流",
@@ -363,6 +443,18 @@ def seed_data_sources():
             "priority": 0,
             "supports_batch": True,
             "test_symbols": ["601127", "600519", "300750"],
+        },
+        {
+            "name": "YFinance 行情",
+            "type": "quote",
+            "provider": "yfinance",
+            "config": {
+                "description": "Yahoo Finance,需 pip install yfinance。适用 HK/US,A 股不可用。",
+            },
+            "enabled": False,
+            "priority": 10,
+            "supports_batch": True,
+            "test_symbols": ["AAPL"],
         },
         # 事件日历数据源（基于公告结构化）
         {
@@ -1113,6 +1205,7 @@ async def lifespan(app):
     """应用生命周期: 初始化 + 启动调度器"""
     init_db()
     setup_logging()
+    setup_proxy()  # 必须在 setup_ssl 之前:代理决定走哪条出口,SSL 证书才匹配
     setup_ssl()
     setup_playwright()
 
